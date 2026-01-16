@@ -1,3 +1,5 @@
+fastapi
+uvicorn
 python-dotenv
 neo4j
 sentence-transformers

@@ -13,6 +13,10 @@ from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 from groq import Groq
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uvicorn
 
 # Force UTF-8 output on Windows
 if sys.platform == 'win32':
@@ -24,9 +28,6 @@ load_dotenv()
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_AUTH = (os.getenv("NEO4J_USERNAME", "neo4j"), os.getenv("NEO4J_PASSWORD", "password"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY is not set in .env file")
 
 # Term mappings
 TERM_MAPPINGS = {
@@ -41,6 +42,49 @@ TERM_MAPPINGS = {
     "ajiva": ["Ajīva", "non-soul"],
     "karma": ["Karma", "karmic matter"],
 }
+
+# Initialize FastAPI
+app = FastAPI(title="Jain Philosophy Chatbot API")
+
+# Allow CORS for testing
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    query: str
+
+class ChatResponse(BaseModel):
+    answer: str
+
+# Global resources
+resources = {}
+
+def get_resources():
+    """Lazy load resources"""
+    if not resources:
+        if not GROQ_API_KEY:
+            raise ValueError("GROQ_API_KEY is not set in .env file or environment variables")
+            
+        try:
+            driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+            driver.verify_connectivity()
+            embedder = SentenceTransformer('all-mpnet-base-v2')
+            retriever = HybridRetriever(driver, embedder)
+            client = Groq(api_key=GROQ_API_KEY)
+            
+            resources['driver'] = driver
+            resources['retriever'] = retriever
+            resources['client'] = client
+            print("✓ Resources loaded")
+        except Exception as e:
+            print(f"✗ Error loading resources: {e}")
+            raise e
+    return resources
 
 def search_neo4j_comprehensive(driver, embedder, query: str) -> List[Dict]:
     """
@@ -204,11 +248,33 @@ def ask_jain_sage(user_query: str, retriever: HybridRetriever, client: Groq) -> 
         temperature=0.5,
         max_completion_tokens=2048,
         top_p=0.95,
-        
-
     )
 
     return completion.choices[0].message.content
+
+@app.on_event("startup")
+async def startup_event():
+    # Attempt to load resources on startup (useful for Render to fail early if missing env vars)
+    try:
+        get_resources()
+    except Exception as e:
+        print(f"Warning: Could not initialize resources on startup: {e}")
+
+@app.get("/")
+def read_root():
+    return {"status": "Jain Sage AI is API Ready", "endpoints": "/chat"}
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    try:
+        res = get_resources()
+        retriever = res['retriever']
+        client = res['client']
+        
+        answer = ask_jain_sage(request.query, retriever, client)
+        return ChatResponse(answer=answer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 def main():
     print("="*60)
@@ -217,19 +283,11 @@ def main():
     print("="*60)
 
     try:
-        # Init Resources
-        driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
-        driver.verify_connectivity()
-        embedder = SentenceTransformer('all-mpnet-base-v2')
-        retriever = HybridRetriever(driver, embedder)
-        
-        # Init Groq Client
-        client = Groq(api_key=GROQ_API_KEY)
-        
-        print("\n✓ System Ready")
-        
+        res = get_resources()
+        retriever = res['retriever']
+        client = res['client']
     except Exception as e:
-        print(f"\n✗ Error: {e}")
+        print(f"\n✗ Configuration Error: {e}")
         return
 
     # Loop
@@ -249,7 +307,10 @@ def main():
         except Exception as e:
             print(f"\nError: {e}")
 
-    driver.close()
+    res['driver'].close()
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "run-server":
+        uvicorn.run(app, host="0.0.0.0", port=10000)
+    else:
+        main()
